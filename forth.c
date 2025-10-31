@@ -9,9 +9,7 @@
 #define OBJ_TYPE_SYMBOL 4
 #define OBJ_TYPE_LIST 5
 
-#define retain(x)                                                              \
-  if (x)                                                                       \
-  (x)->refcount++
+#define retain(x) if (x) (x)->refcount++                                       \
 
 #define release(x)                                                             \
   if (x)                                                                       \
@@ -120,30 +118,30 @@ context *newCtx() {
 
 int tokenizeNumber(char **curr, size_t *len) {
   char *start = *curr;
-  while (*curr && isdigit(**curr)) {
-    (*curr)++;
-  }
+
+  while (*curr && isdigit(**curr)) (*curr)++;
+
   *len = *curr - start;
   return len > 0;
 }
 
 int tokenizeSym(char **curr, size_t *len) {
   char *start = *curr;
-  while (*curr && isalnum(**curr))
-    (*curr)++;
+
+  while (*curr && isalnum(**curr)) (*curr)++;
+  
   *len = *curr - start;
   return 1;
 }
 
 int tokenizeStr(char **curr, size_t *len) {
   char *start = *curr;
-  if (**curr != '"')
-    return 0;
+  if (**curr != '"') return 0;
 
   (*curr)++;
 
-  while (*curr && **curr != '"')
-    (*curr)++;
+  while (*curr && **curr != '"') (*curr)++;
+
   *len = *curr - start;
   return **curr != 0;
 }
@@ -151,10 +149,14 @@ int tokenizeStr(char **curr, size_t *len) {
 void tokenize(context *ctx, char **curr) {
   int (*tok[])(char **, size_t *) = {tokenizeNumber, tokenizeStr, tokenizeSym};
   while (*curr) {
-    if (!isalnum(**curr))
-      continue;
+    if (!isalnum(**curr)) continue;
     char *start = *curr;
     size_t len = 0;
+    for (int i = 0; i < 3; i++) {
+      if (tok[i](curr, &len)) {
+
+      } 
+    }
   }
 }
 
@@ -164,17 +166,25 @@ void readFile(context *ctx, char *filename) {
     perror("Unable to open file:");
     exit(1);
   }
-  char buff[1024];
-  while (fgets(buff, sizeof(buff), fd)) {
+  char *buff[1024];
+  while (fgets(*buff, sizeof(buff), fd)) {
+    tokenize(ctx, buff);
   }
   fclose(fd);
+}
+
+void parse(context *ctx) {
+
 }
 
 int main(int argc, char **argv) {
   if (argc != 1) {
     printf("Usage: %s <filename>\n", argv[0]);
+    printf("In the future you can start the forth interpreter in REPL mode\n");
     return 1;
   }
 
   context *ctx = newCtx();
+  readFile(ctx, argv[1]);
+  parse(ctx);
 }
