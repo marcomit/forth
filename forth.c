@@ -15,56 +15,89 @@
 #define OBJ_LIST_LEN 16
 #define OBJ_MAX_INT_LEN 128
 #define OBJ_MAX_STRING_LEN 128
+#define OBJ_HASHTABLE_LEN 256
 
-#define retain(x) if (x) (x)->refcount++                                       \
+#define automemory                                                             \
+  int refcount;                                                                \
+  void (*free)(void *)
+
+#define resizable(T)                                                           \
+    T *ptr;                                                                    \
+    size_t len;                                                                \
+    size_t size
+
+#define push(l, e) do {                                                        \
+  if ((l).len >= (l).size) {                                                   \
+    (l).size = (l).size ? (l).size << 1 : OBJ_LIST_LEN;                        \
+    (l).ptr = xrealloc((l).ptr, (l).size * sizeof(*(l).ptr));                  \
+  }                                                                            \
+  (l).ptr[(l).len++] = (e);                                                    \
+} while(0)
+
+#define pop(l) ({                                                              \
+    __typeof(*(l).ptr) result = {0};                                           \
+    if ((l).len > 0) {                                                         \
+        result = (l).ptr[--(l).len];                                           \
+    }                                                                          \
+    result;                                                                    \
+})
+
+#define retain(x) do { if (x) (x)->refcount++; } while(0)                      \
 
 #define release(x)                                                             \
-  if (x)                                                                       \
-    if (--(x)->refcount == 0)                                                  \
-      if ((x)->free)                                                           \
-        (x)->free(x);                                                          \
-      else                                                                     \
-        free(x)
-
-#define append(array, element)                                                 \
   do {                                                                         \
-    if ((array)->l.len >= (array)->l.size) {                                   \
-      (array)->l.size <<= 1;                                                   \
-      (array)->l.ptr = xrealloc((array)->l.ptr, (array)->l.size);              \
+  if (x)                                                                       \
+    if (--(x)->refcount == 0) {                                                \
+      if ((x)->free) (x)->free(x);                                             \
+      else free(x);                                                            \
     }                                                                          \
-    (array)->l.ptr[(array)->l.len++] = element;                                \
   } while (0)
 
 /* ==================================== Object structure ===================== */
+
+typedef struct bucket_t {
+  char *key;
+  void *value;
+  struct bucket_t *next;
+} bucket_t;
+
+typedef struct map {
+  automemory;
+  resizable(bucket_t *);
+} hmap;
+
 typedef struct obj {
-  int refcount;
+  automemory;
   int type;
   union {
     int i;
     struct {
-      char *ptr;
-      size_t len;
-      size_t size;
+      resizable(char);
     } s;
     struct {
-      struct obj **ptr;
-      size_t len;
-      size_t size;
+      resizable(struct obj *);
     } l;
   };
 } obj_t;
 
+
 typedef struct context_t {
   obj_t *stack;
-  obj_t *bstack;
-  int bdepth;
-  obj_t *vars;
+  hmap *symbols; /* hash map to store the functions associated to the symbols */
+  hmap *vars; /* variables stored here */
 } context_t;
 
 typedef struct parser_t {
   char *program;
   char *current;
 } parser_t;
+
+
+typedef struct func_t {
+  void *func;
+  int arity;
+} func_t;
+
 
 obj_t *compile(char *);
  void exec(obj_t *);
@@ -85,6 +118,76 @@ void *xrealloc(void *ptr, size_t bytes) {
     exit(1);
   }
   return new;
+}
+
+/* ======================================= Hash table ===================================== */
+
+#define hmapIndex(m, s) hash(s) & ((m)->size - 1)
+#define hmapNode(m, s) (m)->ptr[hmapIndex(m, s)]
+
+hmap *newHmap() {
+  hmap *h = xmalloc(sizeof(hmap));
+  h->ptr = xmalloc(sizeof(bucket_t *) * OBJ_HASHTABLE_LEN);
+  h->size = OBJ_HASHTABLE_LEN;
+  h->len = 0;
+  return h;
+}
+
+void freeBucket(bucket_t *node, int recursive) {
+  if (!node) return;
+  if (node->next && recursive) freeBucket(node->next, recursive);
+  free(node);
+}
+
+void freeHmap(hmap *m) {
+  for (size_t i = 0; i < m->size; i++) {
+    freeBucket(m->ptr[i], 1);
+  }
+  free(m);
+}
+
+uint32_t hash(char *string) {
+  uint32_t h = 5381;
+  for (char *c = string; *c; c++) {
+    h = h * 33 + *c;
+  }
+  return h;
+}
+
+int hmapHas(hmap *m, char *key) {
+  bucket_t *node = hmapNode(m, key);
+  while (node) {
+    if (!strcmp(node->key, key)) return 1;
+    node = node->next;
+  }
+  return 0;
+}
+
+void *hmapGet(hmap *m, char *key) {
+  bucket_t *node = hmapNode(m, key);
+  while (node) {
+    if (!strcmp(node->key, key)) return node;
+    node = node->next;
+  }
+  return NULL;
+}
+
+void hmapSet(hmap *m, char* key, void *value) {
+  uint32_t index = hmapIndex(m, key);
+  bucket_t *node = xmalloc(sizeof(bucket_t));
+  node->key = strdup(key);
+  node->value = value;
+  bucket_t *dummy = m->ptr[index];
+  if (!dummy) {
+    m->ptr[index] = node;
+    return;
+  }
+  while (dummy && dummy->next) {
+    if (strcmp(dummy->key, key) == 0) {
+      return;
+    }
+  }
+  dummy->next = node;
 }
 
 /* ==================================== Object management ================================= */
@@ -167,17 +270,16 @@ void print(obj_t *o) {
 }
 
 context_t *newContext() {
-  context_t *ctx = xmalloc(sizeof(context_t *));
+  context_t *ctx = xmalloc(sizeof(context_t));
   ctx->stack = newList();
-  ctx->bstack = newList();
-  ctx->bdepth = 0;
-  // ctx->vars;
+  ctx->vars = newHmap();
+  ctx->symbols = newHmap();
   return ctx;
 }
 
 /* ======================================= Turn program into list ==============================*/
 
-#define consume(parser) (parser)->current++
+#define consume(parser) *(++(parser)->current)
 #define peek(parser) *(parser)->current
 
 void parseSpaces(parser_t *parser) {
@@ -186,7 +288,10 @@ void parseSpaces(parser_t *parser) {
 
 obj_t *parseInt(parser_t *parser) {
   char *start = parser->current;
-  if (peek(parser) == '-') consume(parser);
+  if (peek(parser) == '-') {
+    consume(parser);
+    if (!isdigit(peek(parser))) return newSym(strdup("-"), 1);
+  }
   while (peek(parser) && isdigit(*parser->current)) consume(parser);
   size_t len = parser->current - start;
   if (len == 0 || len > 128) return NULL;
@@ -243,25 +348,6 @@ obj_t *parseList(parser_t *parser) {
   return list;
 }
 
-// obj_t *parseTuple(parser_t *parser) {
-//   if (*parser->current != '(') return NULL;
-//   consume(parser);
-//   char *start = parser->current;
-//   int level = 1;
-//   while (peek(parser) && level > 0) {
-//     if (peek(parser) == '(') level++;
-//     else if (peek(parser) == ')') level--;
-//     consume(parser);
-//   }
-//   size_t len = parser->current - start - 1;
-//   char buff[len+1];
-//   memcpy(buff, start, len);
-//   buff[len] = 0;
-//   obj_t *list = compile(buff);
-//   list->type = OBJ_TYPE_TUPLE;
-//   return list;
-// }
-
 obj_t *compile(char *text) {
   parser_t parser;
   parser.program = text;
@@ -282,13 +368,10 @@ obj_t *compile(char *text) {
     else if (peek(&parser) == '[') {
       o = parseList(&parser);
     }
-    // else if (*parser.current == '(') {
-    //   o = parseTuple(&parser);
-    // }
     else {
       o = parseSymbol(&parser);
     }
-    if (o) append(parsed, o);
+    if (o) push(parsed->l, o);
     else printf("Error parsing near %s ...\n", start);
   }
 
@@ -296,25 +379,56 @@ obj_t *compile(char *text) {
 }
 
 /* ================================ Executing the object ================================ */
+#define binary_params(ctx) obj_t *second = pop((ctx)->stack->l); obj_t *first = pop((ctx)->stack->l)
+
+obj_t *plus(context_t *ctx) {binary_params(ctx); return newInt(first->i + second->i);}
+obj_t *minus(context_t *ctx) {binary_params(ctx); return newInt(first->i - second->i); }
+obj_t *division(context_t *ctx) {binary_params(ctx); return newInt(first->i / second->i); }
+obj_t *mul(context_t *ctx) {binary_params(ctx); return newInt(first->i * second->i); }
+
+obj_t *consumeIf(context_t *ctx) {
+  obj_t *branch = pop(ctx->stack->l);
+  obj_t *condition = pop(ctx->stack->l);
+  if (condition->i) {
+    exec(branch);
+  }
+  return NULL;
+}
 
 void consumeObject(context_t *ctx, obj_t *o) {
-
+  if (o->type != OBJ_TYPE_SYMBOL) {
+    push(ctx->stack->l, o);
+    return;
+  }
+  func_t *sym = (func_t *)hmapGet(ctx->vars, o->s.ptr);
+  if (!sym) {
+    fprintf(stderr, "Error: Symbol '%s' not found!\n", o->s.ptr);
+    exit(1);
+  }
+  // if ((int)ctx->stack->l.len < sym->arity) {
+    // fprintf(stderr, "Expected at least %d elements, got %zu\n", sym->arity, ctx->stack->l.len);
+    // exit(1);
+  // }
+  obj_t *(*func)(context_t *) = sym->func;
+  obj_t *result = func(ctx);
+  if (result) push(ctx->stack->l, result);
 }
 
 void exec(obj_t *list) {
   context_t *ctx = newContext();
-  print(list);
-  for (size_t i = 0; i < list->l.len; i++) {
-    obj_t *curr = list->l.ptr[i];
+  hmapSet(ctx->vars, "+", &(func_t){plus, 2});
+  hmapSet(ctx->vars, "-", &(func_t){minus, 2});
+  hmapSet(ctx->vars, "/", &(func_t){division, 2});
+  hmapSet(ctx->vars, "*", &(func_t){mul, 2});
 
+  for (size_t i = 0; i < list->l.len; i++) {
+    consumeObject(ctx, list->l.ptr[i]);
   }
 }
 
-
 int main(int argc, char **argv) {
   if (argc != 2) {
-    printf("Usage: %s <filename>\n", argv[0]);
-    printf("In the future you can start the forth interpreter in REPL mode\n");
+    printf("Usage %s <filename>\n", *argv);
     return 1;
   }
 
@@ -328,5 +442,6 @@ int main(int argc, char **argv) {
   fclose(fd);
 
   obj_t *parsed = compile(prgtext);
+  print(parsed);
   exec(parsed);
 }
