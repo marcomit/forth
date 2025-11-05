@@ -166,7 +166,7 @@ int hmapHas(hmap *m, char *key) {
 void *hmapGet(hmap *m, char *key) {
   bucket_t *node = hmapNode(m, key);
   while (node) {
-    if (!strcmp(node->key, key)) return node;
+    if (!strcmp(node->key, key)) return node->value;
     node = node->next;
   }
   return NULL;
@@ -380,11 +380,13 @@ obj_t *compile(char *text) {
 
 /* ================================ Executing the object ================================ */
 #define binary_params(ctx) obj_t *second = pop((ctx)->stack->l); obj_t *first = pop((ctx)->stack->l)
+#define unary_params(ctx) obj_t *last = pop((ctx)->stack->l)
 
-obj_t *plus(context_t *ctx) {binary_params(ctx); return newInt(first->i + second->i);}
-obj_t *minus(context_t *ctx) {binary_params(ctx); return newInt(first->i - second->i); }
-obj_t *division(context_t *ctx) {binary_params(ctx); return newInt(first->i / second->i); }
-obj_t *mul(context_t *ctx) {binary_params(ctx); return newInt(first->i * second->i); }
+obj_t *plus(context_t *ctx) { binary_params(ctx); return newInt(first->i + second->i);}
+obj_t *minus(context_t *ctx) { binary_params(ctx); return newInt(first->i - second->i); }
+obj_t *division(context_t *ctx) { binary_params(ctx); return newInt(first->i / second->i); }
+obj_t *mul(context_t *ctx) { binary_params(ctx); return newInt(first->i * second->i); }
+obj_t *printObj(context_t *ctx) { unary_params(ctx); print(last); return NULL; }
 
 obj_t *consumeIf(context_t *ctx) {
   obj_t *branch = pop(ctx->stack->l);
@@ -405,10 +407,10 @@ void consumeObject(context_t *ctx, obj_t *o) {
     fprintf(stderr, "Error: Symbol '%s' not found!\n", o->s.ptr);
     exit(1);
   }
-  // if ((int)ctx->stack->l.len < sym->arity) {
-    // fprintf(stderr, "Expected at least %d elements, got %zu\n", sym->arity, ctx->stack->l.len);
-    // exit(1);
-  // }
+  if ((int)ctx->stack->l.len < sym->arity) {
+    fprintf(stderr, "Expected at least %d elements, got %zu\n", sym->arity, ctx->stack->l.len);
+    exit(1);
+  }
   obj_t *(*func)(context_t *) = sym->func;
   obj_t *result = func(ctx);
   if (result) push(ctx->stack->l, result);
@@ -420,10 +422,14 @@ void exec(obj_t *list) {
   hmapSet(ctx->vars, "-", &(func_t){minus, 2});
   hmapSet(ctx->vars, "/", &(func_t){division, 2});
   hmapSet(ctx->vars, "*", &(func_t){mul, 2});
+  hmapSet(ctx->vars, ".", &(func_t){printObj, 2});
 
   for (size_t i = 0; i < list->l.len; i++) {
     consumeObject(ctx, list->l.ptr[i]);
   }
+
+  printf("STACK\n");
+  print(ctx->stack);
 }
 
 int main(int argc, char **argv) {
