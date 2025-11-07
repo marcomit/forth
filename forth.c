@@ -17,43 +17,72 @@
 #define OBJ_MAX_STRING_LEN 128
 #define OBJ_HASHTABLE_LEN 256
 
-#define refcounted(I)                                                          \
-  I refcount;                                                                  \
-  void (*free)(void *)
-
-#define retain(x) do { if (x) (x)->refcount++; } while(0)                      \
-
-#define release(x)                                                             \
-  do {                                                                         \
-  if (x)                                                                       \
-    if (--(x)->refcount == 0) {                                                \
-      if ((x)->free) (x)->free(x);                                             \
-      else free(x);                                                            \
-    }                                                                          \
-  } while (0)
-
-#define resizable(T)                                                           \
-    T *ptr;                                                                    \
-    size_t len;                                                                \
-    size_t size
-
-#define push(l, e) do {                                                        \
-  if ((l).len >= (l).size) {                                                   \
-    (l).size = (l).size ? (l).size << 1 : OBJ_LIST_LEN;                        \
-    (l).ptr = xrealloc((l).ptr, (l).size * sizeof(*(l).ptr));                  \
-  }                                                                            \
-  (l).ptr[(l).len++] = (e);                                                    \
+/* Error messages */
+#define VAR_NOT_FOUND(ptr) do {                                                 \
+  fprintf(stderr, "Variable %s not found\n", ptr);                              \
+  exit(1);                                                                      \
 } while(0)
 
-#define pop(l) ({                                                              \
-    __typeof(*(l).ptr) result = {0};                                           \
-    if ((l).len > 0) {                                                         \
-        result = (l).ptr[--(l).len];                                           \
-    }                                                                          \
-    result;                                                                    \
+#define EXPECTED_TYPE(o, t) do {                                                \
+  if ((o)->type == (t)) break;                                                  \
+  fprintf(stderr, "Expected type %d, got %d\n", t, (o)->type);                  \
+  exit(1);                                                                      \
+} while(0)
+
+#define EXPECTED_STACK_LEN(s, n)  do {                                          \
+  if ((s).len >= (size_t)(n)) break;                                            \
+  fprintf(stderr, "Expected %d arguments, got %zu for ", n, (s).len);           \
+  print(o, 0);                                                                  \
+  exit(1);                                                                      \
+} while(0)
+
+#define refcounted(I)                                                           \
+  I refcount;                                                                   \
+  void (*free)(void *)
+
+#define initrefcount(o, func) do { (o)->refcount = 1; (o)->free = func;         \
+  } while(0)
+
+#define retain(x) do { if (x) (x)->refcount++; } while(0)                       \
+
+
+#define release(x)                                                              \
+  do {                                                                          \
+  if (x)                                                                        \
+    if (--(x)->refcount == 0) {                                                 \
+      if ((x)->free) (x)->free(x);                                              \
+      else free(x);                                                             \
+      (x) = NULL;                                                               \
+    }                                                                           \
+  } while (0)
+
+#define resizable(T)                                                            \
+    T *ptr;                                                                     \
+    size_t len;                                                                 \
+    size_t size
+
+#define push(l, e) do {                                                         \
+  if ((l).len >= (l).size) {                                                    \
+    (l).size = (l).size ? (l).size << 1 : OBJ_LIST_LEN;                         \
+    (l).ptr = realloc((l).ptr, (l).size * sizeof(*(l).ptr));                    \
+  }                                                                             \
+  (l).ptr[(l).len++] = (e);                                                     \
+} while(0)
+
+#define pop(l) ({                                                               \
+    __typeof(*(l).ptr) result = {0};                                            \
+    if ((l).len > 0) {                                                          \
+        result = (l).ptr[--(l).len];                                            \
+    }                                                                           \
+    result;                                                                     \
 })
 
 #define top(l) (l).ptr[(l).len - 1]
+
+#define iter(l, n) for(size_t i = 0; i < (l).len; i++) {\
+  __typeof(*(l).ptr) n = l.ptr[i];\
+
+#define enditer }
 
 /* ==================================== Object structure ===================== */
 
@@ -63,32 +92,35 @@ typedef struct bucket_t {
   struct bucket_t *next;
 } bucket_t;
 
-typedef struct map {
+typedef struct hmap {
   refcounted(int);
   resizable(bucket_t *);
 } hmap;
 
-typedef struct obj {
+typedef struct obj_t {
   refcounted(int);
   int type;
   union {
-    int i;
+    int i; // Used for both integer and boolean values
     struct {
       resizable(char);
-    } s;
+    } s; // Used for both string and symbol values
     struct {
-      resizable(struct obj *);
-    } l;
+      resizable(struct obj_t *);
+    } l; // Used for lists
   };
 } obj_t;
 
+typedef struct scope_t {
+  hmap *symbols; /* hash map to store the functions associated to the symbols. */
+  hmap *vars; /* variables stored here. */
+  struct scope_t *parent; /* scopes to handle closures.*/
+} scope_t;
 
 typedef struct context_t {
-  refcounted(int);
   obj_t *stack;
-  hmap *symbols; /* hash map to store the functions associated to the symbols */
-  hmap *vars; /* variables stored here */
-  struct context_t *parent;
+  scope_t *global;
+  scope_t *current;
 } context_t;
 
 typedef struct parser_t {
@@ -104,24 +136,15 @@ typedef struct func_t {
 
 
 obj_t *compile(char *);
- void exec(obj_t *, context_t *);
+ void exec(context_t *, obj_t *);
 
 /* ================================== Memory allocator wrapper ============================ */
+
 void *xmalloc(size_t bytes) {
   void *ptr = malloc(bytes);
-  if (!ptr) {
-    fprintf(stderr, "Unable to allocate %zu\n", bytes);
-    exit(1);
-  }
-  return ptr;
-}
-void *xrealloc(void *ptr, size_t bytes) {
-  void *new = realloc(ptr, bytes);
-  if (!new) {
-    fprintf(stderr, "Unable to reallocate %zu\n", bytes);
-    exit(1);
-  }
-  return new;
+  if (ptr) return ptr;
+  fprintf(stderr, "Unable to allocate %zu\n", bytes);
+  exit(1);
 }
 
 /* ======================================= Hash table ===================================== */
@@ -196,8 +219,19 @@ void hmapSet(hmap *m, char* key, void *value) {
 
 /* ==================================== Object management ================================= */
 
+void freeObj(void *ptr) {
+  obj_t *self = ptr;
+  if (self->type == OBJ_TYPE_LIST || self->type == OBJ_TYPE_TUPLE) {
+    iter(self->l, curr) release(curr); enditer
+  } else if (self->type == OBJ_TYPE_STRING || self->type == OBJ_TYPE_SYMBOL) {
+    free(self->s.ptr);
+  }
+  free(self);
+}
+
 obj_t *newObj(int type) {
   obj_t *o = xmalloc(sizeof(obj_t));
+  initrefcount(o, freeObj);
   o->type = type;
   return o;
 }
@@ -259,11 +293,12 @@ obj_t *copy(obj_t *original) {
   return cloned;
 }
 
-void print(obj_t *o) {
+void print(obj_t *o, int depth) {
   if (!o) {
     printf("null");
     return;
   }
+  for (int i = 0; i < depth; i++) printf("  ");
   switch (o->type) {
     case OBJ_TYPE_BOOL:
       printf("bool(%s)", o->i ? "true" : "false");
@@ -278,17 +313,13 @@ void print(obj_t *o) {
       printf("symbol(%s)", o->s.ptr);
       break;
     case OBJ_TYPE_LIST:
-      printf("list(");
-      for (size_t i = 0; i < o->l.len; i++) {
-        print(o->l.ptr[i]);
-      }
+      printf("list(\n");
+      iter(o->l, curr) print(curr, depth + 1); enditer
       printf(")");
       break;
     case OBJ_TYPE_TUPLE:
-      printf("tuple(");
-      for (size_t i = 0; i < o->l.len; i++) {
-        print(o->l.ptr[i]);
-      }
+      printf("tuple(\n");
+      iter(o->l, curr) print(curr, depth + 1); enditer
       printf(")");
       break;
     default:
@@ -297,44 +328,53 @@ void print(obj_t *o) {
   printf("\n");
 }
 
-context_t *newContext(context_t *parent) {
+void freeScope(struct scope_t *scope) {
+  // freeHmap(scope->symbols);
+  // freeHmap(scope->vars);
+  // free(scope);
+}
+
+scope_t *newScope(scope_t *parent) {
+  scope_t *scope = xmalloc(sizeof(scope_t));
+  scope->parent = parent;
+  scope->symbols = newHmap();
+  scope->vars = newHmap();
+  return scope;
+}
+
+func_t *getFunc(context_t *ctx, char *name) {
+  scope_t *dummy = ctx->current;
+  while (dummy) {
+    func_t *val = (func_t *)hmapGet(dummy->symbols, name);
+    if (val) return val;
+    dummy = dummy->parent;
+  }
+  return NULL;
+}
+
+obj_t *getVar(context_t *ctx, char *name) {
+  scope_t *dummy = ctx->current;
+  while (dummy) {
+    void *val = hmapGet(dummy->vars, name);
+    if (val) return (obj_t *)val;
+    dummy = dummy->parent;
+  }
+  return NULL;
+}
+
+context_t *newContext() {
   context_t *ctx = xmalloc(sizeof(context_t));
   ctx->stack = newList();
-  ctx->vars = newHmap();
-  ctx->symbols = newHmap();
-  ctx->parent = parent;
+  ctx->global = newScope(NULL);
+  ctx->current = ctx->global;
   return ctx;
 }
 
-obj_t *getObj(char *name, context_t *ctx) {
-  context_t *curr = ctx;
-  while (curr) {
-    obj_t *var = hmapGet(curr->vars, name);
-    if (var) return var;
-    curr = curr->parent;
-  }
-  return NULL;
-}
-  
-func_t *getFunc(char *name, context_t *ctx) {
-  context_t *curr = ctx;
-  while (curr) {
-    func_t *f = (func_t *)hmapGet(curr->symbols, name);
-    if (f) return f;
-    curr = curr->parent;
-  }
-    
-  return NULL;
-}
 
 /* ======================================= Turn program into list ==============================*/
 
 #define consume(parser) *(++(parser)->current)
 #define peek(parser) *(parser)->current
-
-void parseSpaces(parser_t *parser) {
-  while (peek(parser) && isspace(*parser->current)) consume(parser);
-}
 
 obj_t *parseInt(parser_t *parser) {
   char *start = parser->current;
@@ -407,7 +447,7 @@ obj_t *compile(char *text) {
   while (*parser.current) {
     obj_t *o = NULL;
     char *start = parser.current;
-    parseSpaces(&parser);
+    while (peek(&parser) && isspace(*parser.current)) consume(&parser);
     if (!peek(&parser)) break;
 
     if (peek(&parser) == '"') {
@@ -430,12 +470,30 @@ obj_t *compile(char *text) {
 #define binary_params(ctx) obj_t *second = pop((ctx)->stack->l); obj_t *first = pop((ctx)->stack->l)
 #define unary_params(ctx) obj_t *last = pop((ctx)->stack->l)
 
+#define BINARY_OP(name, op, type)                                         \
+obj_t *name(context_t *ctx) {                                             \
+    binary_params(ctx);                                                   \
+    return type(first->i op second->i);                                   \
+}
+
+obj_t *printObj(context_t *ctx) { print(pop(ctx->stack->l), 0); return NULL; }
+
 /* ======================== Arithmetic operations ======================== */
-obj_t *plus(context_t *ctx) { binary_params(ctx); return newInt(first->i + second->i);}
-obj_t *minus(context_t *ctx) { binary_params(ctx); return newInt(first->i - second->i); }
-obj_t *division(context_t *ctx) { binary_params(ctx); return newInt(first->i / second->i); }
-obj_t *mul(context_t *ctx) { binary_params(ctx); return newInt(first->i * second->i); }
-obj_t *printObj(context_t *ctx) { unary_params(ctx); print(last); return NULL; }
+BINARY_OP(plus, +, newInt)
+BINARY_OP(minus, -, newInt)
+BINARY_OP(division, /, newInt)
+BINARY_OP(mul, *, newInt)
+
+/* ========================== Binary operations ========================== */
+BINARY_OP(consumeAnd, &&, newBool)
+BINARY_OP(consumeOr, ||, newBool)
+BINARY_OP(consumeGE, >, newBool)
+BINARY_OP(consumeLE, <, newBool)
+BINARY_OP(consumeGTE, >=, newBool)
+BINARY_OP(consumeLTE, <=, newBool)
+BINARY_OP(consumeEQ, ==, newBool)
+
+obj_t *consumeNot(context_t *ctx) { unary_params(ctx); return newBool(!last->i); }
 
 /* ========================== Stack operations =========================== */
 obj_t *dup(context_t *ctx) { return copy(top(ctx->stack->l)); }
@@ -447,7 +505,7 @@ obj_t *consumeIf(context_t *ctx) {
   obj_t *branch = pop(ctx->stack->l);
   obj_t *condition = pop(ctx->stack->l);
   if (condition->i) {
-    exec(branch, ctx);
+    exec(ctx, branch);
   }
   return NULL;
 }
@@ -456,59 +514,104 @@ obj_t *consumeIfElse(context_t *ctx) {
   obj_t *fbranch = pop(ctx->stack->l);
   obj_t *tbranch = pop(ctx->stack->l);
   obj_t *condition = pop(ctx->stack->l);
-  exec(condition->i ? tbranch : fbranch, ctx);
+  exec(ctx, condition->i ? tbranch : fbranch);
   return NULL;
 }
 
-void consumeObject(context_t *ctx, obj_t *o) {
-  if (o->type != OBJ_TYPE_SYMBOL) {
-    push(ctx->stack->l, o);
-    return;
-  }
-  func_t *sym = (func_t *)hmapGet(ctx->symbols, o->s.ptr);
-  if (!sym) {
-    fprintf(stderr, "Error: Symbol '%s' not found!\n", o->s.ptr);
-    exit(1);
-  }
-  if (ctx->stack->l.len < (size_t)sym->arity) {
-    fprintf(stderr, "Expected at least %d elements, got %zu for symbol %s\n", sym->arity, ctx->stack->l.len, o->s.ptr);
-    exit(1);
-  }
-  obj_t *(*func)(context_t *) = sym->func;
-  obj_t *result = func(ctx);
-  if (result) {
-    printf("result pushed to the stack ");
-    print(result);
-    push(ctx->stack->l, result);
-  }
+obj_t *consumeLoop(context_t *ctx) {
+  obj_t *branch = pop(ctx->stack->l);
+  obj_t *condition = pop(ctx->stack->l);
+
+  do {
+    exec(ctx, condition);
+    obj_t *result = top(ctx->stack->l);
+    if (result->i) break;
+    exec(ctx, branch);
+  } while(1);
+  return NULL;
+}
+
+func_t *newfunc(void *func, int arity) {
+  func_t *f = xmalloc(sizeof(func_t));
+  f->arity = arity;
+  f->func = func;
+  return f;
 }
 
 void loadSymbols(context_t *ctx) {
   /* === Arithmetic symbols === */
-  hmapSet(ctx->symbols, "+", &(func_t){plus, 2});
-  hmapSet(ctx->symbols, "-", &(func_t){minus, 2});
-  hmapSet(ctx->symbols, "/", &(func_t){division, 2});
-  hmapSet(ctx->symbols, "*", &(func_t){mul, 2});
-  hmapSet(ctx->symbols, ".", &(func_t){printObj, 1});
+  hmapSet(ctx->current->symbols, "+", newfunc(plus, 2));
+  hmapSet(ctx->current->symbols, "-", newfunc(minus, 2));
+  hmapSet(ctx->current->symbols, "/", newfunc(division, 2));
+  hmapSet(ctx->current->symbols, "*", newfunc(mul, 2));
+  hmapSet(ctx->current->symbols, ".", newfunc(printObj, 1));
+
+  /* === Boolean operations === */
+  hmapSet(ctx->current->symbols, "and", newfunc(consumeAnd, 2));
+  hmapSet(ctx->current->symbols, "or", newfunc(consumeOr, 2));
+  hmapSet(ctx->current->symbols, "not", newfunc(consumeNot, 1));
+
+  /* === Integer comparator === */
+  hmapSet(ctx->current->symbols, ">", newfunc(consumeGE, 2));
+  hmapSet(ctx->current->symbols, "<", newfunc(consumeLE, 2));
+  hmapSet(ctx->current->symbols, "==", newfunc(consumeEQ, 2));
+  hmapSet(ctx->current->symbols, "<=", newfunc(consumeLTE, 2));
+  hmapSet(ctx->current->symbols, ">=", newfunc(consumeGTE, 2));
 
   /* ==== Stack operations ==== */
-  hmapSet(ctx->symbols, "dup", &(func_t){dup, 1});
-  hmapSet(ctx->symbols, "drop", &(func_t){drop, 1});
-  hmapSet(ctx->symbols, "swap", &(func_t){swap, 2});
-  
+  hmapSet(ctx->current->symbols, "dup", newfunc(dup, 1));
+  hmapSet(ctx->current->symbols, "drop", newfunc(drop, 1));
+  hmapSet(ctx->current->symbols, "swap", newfunc(swap, 2));
+
   /* ====== Control flow ====== */
-  hmapSet(ctx->symbols, "if", &(func_t){consumeIf, 2});
-  hmapSet(ctx->symbols, "ifelse", &(func_t){consumeIfElse, 2});
+  hmapSet(ctx->current->symbols, "if", newfunc(consumeIf, 2));
+  hmapSet(ctx->current->symbols, "ifelse", newfunc(consumeIfElse, 2));
+  hmapSet(ctx->current->symbols, "loop", newfunc(consumeLoop, 2));
 }
 
-void exec(obj_t *list, context_t *parent) {
-  context_t *ctx = newContext(parent);
-  if (!parent) loadSymbols(ctx);
-  
-  for (size_t i = 0; i < list->l.len; i++) {
-    consumeObject(ctx, list->l.ptr[i]);
+int consumeVariables(context_t *ctx, obj_t *o) {
+  if (o->s.len == 0) return 0;
+  obj_t *val = getVar(ctx, o->s.ptr + 1);
+  if (*o->s.ptr == ':') {
+    obj_t *last = pop(ctx->stack->l);
+    hmapSet(ctx->current->vars, o->s.ptr + 1, last);
   }
+  else if (*o->s.ptr == '@') {
+    if (!val) VAR_NOT_FOUND(o->s.ptr + 1);
+    push(ctx->stack->l, val);
+  }
+  else if (*o->s.ptr == '!') {
+    if (!val) VAR_NOT_FOUND(o->s.ptr + 1);
+    EXPECTED_TYPE(val, OBJ_TYPE_LIST);
+    exec(ctx, val); 
+  }
+  else return 0;
+  return 1;
+}
 
+int consumeSymbol(context_t *ctx, obj_t *o) {
+  func_t *sym = getFunc(ctx, o->s.ptr);
+  if (!sym) return 0;
+  EXPECTED_STACK_LEN(ctx->stack->l, sym->arity);
+  obj_t *(*func)(context_t *) = sym->func;
+  obj_t *result = func(ctx);
+  if (result) push(ctx->stack->l, result);
+  return 1;
+}
+
+void exec(context_t *ctx, obj_t *list) {
+  ctx->current = newScope(ctx->current);
+  iter(list->l, o)
+    if (o->type != OBJ_TYPE_SYMBOL) {
+      push(ctx->stack->l, o);
+      continue;
+    }
+    if (consumeVariables(ctx, o)) continue;
+    consumeSymbol(ctx, o);
+    
+  enditer
+  freeScope(ctx->current);
+  ctx->current = ctx->current->parent;
 }
 
 int main(int argc, char **argv) {
@@ -527,5 +630,7 @@ int main(int argc, char **argv) {
   fclose(fd);
 
   obj_t *parsed = compile(prgtext);
-  exec(parsed, NULL);
+  context_t *ctx = newContext();
+  loadSymbols(ctx);
+  exec(ctx, parsed);
 }
