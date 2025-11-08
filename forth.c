@@ -4,37 +4,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 #define OBJ_TYPE_STRING 1
 #define OBJ_TYPE_INT 2
 #define OBJ_TYPE_BOOL 3
 #define OBJ_TYPE_SYMBOL 4
 #define OBJ_TYPE_LIST 5
-#define OBJ_TYPE_TUPLE 6
 
 #define OBJ_LIST_LEN 16
 #define OBJ_MAX_INT_LEN 128
 #define OBJ_MAX_STRING_LEN 128
 #define OBJ_HASHTABLE_LEN 256
-
-/* Error messages */
-#define VAR_NOT_FOUND(ptr) do {                                                 \
-  fprintf(stderr, "Variable %s not found\n", ptr);                              \
-  exit(1);                                                                      \
-} while(0)
-
-#define EXPECTED_TYPE(o, t) do {                                                \
-  if ((o)->type == (t)) break;                                                  \
-  fprintf(stderr, "Expected type %d, got %d\n", t, (o)->type);                  \
-  exit(1);                                                                      \
-} while(0)
-
-#define EXPECTED_STACK_LEN(s, n)  do {                                          \
-  if ((s).len >= (size_t)(n)) break;                                            \
-  fprintf(stderr, "Expected %d arguments, got %zu for ", n, (s).len);           \
-  print(o, 0);                                                                  \
-  exit(1);                                                                      \
-} while(0)
 
 #define refcounted(I)                                                           \
   I refcount;                                                                   \
@@ -79,10 +60,10 @@
 
 #define top(l) (l).ptr[(l).len - 1]
 
-#define iter(l, n) for(size_t i = 0; i < (l).len; i++) {\
-  __typeof(*(l).ptr) n = l.ptr[i];\
+#define foreach(n, l) for(size_t i = 0; i < (l).len; i++) {                     \
+  __typeof(*(l).ptr) n = l.ptr[i];                                              \
 
-#define enditer }
+#define endfor }
 
 /* ==================================== Object structure ===================== */
 
@@ -112,8 +93,10 @@ typedef struct obj_t {
 } obj_t;
 
 typedef struct scope_t {
+  refcounted(int);
   hmap *symbols; /* hash map to store the functions associated to the symbols. */
   hmap *vars; /* variables stored here. */
+  int ret;
   struct scope_t *parent; /* scopes to handle closures.*/
 } scope_t;
 
@@ -145,6 +128,15 @@ void *xmalloc(size_t bytes) {
   if (ptr) return ptr;
   fprintf(stderr, "Unable to allocate %zu\n", bytes);
   exit(1);
+}
+
+void error(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fputc('\n', stderr);
+    exit(1);
 }
 
 /* ======================================= Hash table ===================================== */
@@ -181,15 +173,6 @@ uint32_t hash(char *string) {
   return h;
 }
 
-int hmapHas(hmap *m, char *key) {
-  bucket_t *node = hmapNode(m, key);
-  while (node) {
-    if (!strcmp(node->key, key)) return 1;
-    node = node->next;
-  }
-  return 0;
-}
-
 void *hmapGet(hmap *m, char *key) {
   bucket_t *node = hmapNode(m, key);
   while (node) {
@@ -199,6 +182,7 @@ void *hmapGet(hmap *m, char *key) {
   return NULL;
 }
 
+// FIXME: unsupported reassignment variables
 void hmapSet(hmap *m, char* key, void *value) {
   uint32_t index = hmapIndex(m, key);
   bucket_t *node = xmalloc(sizeof(bucket_t));
@@ -211,6 +195,7 @@ void hmapSet(hmap *m, char* key, void *value) {
   }
   while (dummy && dummy->next) {
     if (strcmp(dummy->key, key) == 0) {
+      dummy->value = value;
       return;
     }
   }
@@ -221,8 +206,8 @@ void hmapSet(hmap *m, char* key, void *value) {
 
 void freeObj(void *ptr) {
   obj_t *self = ptr;
-  if (self->type == OBJ_TYPE_LIST || self->type == OBJ_TYPE_TUPLE) {
-    iter(self->l, curr) release(curr); enditer
+  if (self->type == OBJ_TYPE_LIST) {
+    foreach(curr, self->l) release(curr); endfor
   } else if (self->type == OBJ_TYPE_STRING || self->type == OBJ_TYPE_SYMBOL) {
     free(self->s.ptr);
   }
@@ -293,34 +278,28 @@ obj_t *copy(obj_t *original) {
   return cloned;
 }
 
-void print(obj_t *o, int depth) {
+void print(obj_t *o) {
   if (!o) {
     printf("null");
     return;
   }
-  for (int i = 0; i < depth; i++) printf("  ");
   switch (o->type) {
     case OBJ_TYPE_BOOL:
-      printf("bool(%s)", o->i ? "true" : "false");
+      printf("%s", o->i ? "true" : "false");
       break;
     case OBJ_TYPE_INT:
-      printf("int(%d)", o->i);
+      printf("%d", o->i);
       break;
     case OBJ_TYPE_STRING:
-      printf("string(\"%s\")", o->s.ptr);
+      printf("\"%s\"", o->s.ptr);
       break;
     case OBJ_TYPE_SYMBOL:
-      printf("symbol(%s)", o->s.ptr);
+      printf("%s", o->s.ptr);
       break;
     case OBJ_TYPE_LIST:
-      printf("list(\n");
-      iter(o->l, curr) print(curr, depth + 1); enditer
-      printf(")");
-      break;
-    case OBJ_TYPE_TUPLE:
-      printf("tuple(\n");
-      iter(o->l, curr) print(curr, depth + 1); enditer
-      printf(")");
+      printf("[");
+      foreach(curr, o->l) printf(" "); print(curr); endfor
+      printf(" ]");
       break;
     default:
       printf("undefined");
@@ -328,10 +307,11 @@ void print(obj_t *o, int depth) {
   printf("\n");
 }
 
-void freeScope(struct scope_t *scope) {
-  // freeHmap(scope->symbols);
-  // freeHmap(scope->vars);
-  // free(scope);
+void freeScope(void *scope) {
+  scope_t *self = scope;
+  freeHmap(self->symbols);
+  freeHmap(self->vars);
+  free(self);
 }
 
 scope_t *newScope(scope_t *parent) {
@@ -339,6 +319,8 @@ scope_t *newScope(scope_t *parent) {
   scope->parent = parent;
   scope->symbols = newHmap();
   scope->vars = newHmap();
+  scope->ret = 0;
+  initrefcount(scope, freeScope);
   return scope;
 }
 
@@ -359,6 +341,7 @@ obj_t *getVar(context_t *ctx, char *name) {
     if (val) return (obj_t *)val;
     dummy = dummy->parent;
   }
+  error("Variable \"%s\" not found", name);
   return NULL;
 }
 
@@ -470,13 +453,20 @@ obj_t *compile(char *text) {
 #define binary_params(ctx) obj_t *second = pop((ctx)->stack->l); obj_t *first = pop((ctx)->stack->l)
 #define unary_params(ctx) obj_t *last = pop((ctx)->stack->l)
 
+#define use_last(ctx, code) obj_t *last = pop((ctx)->stack->l);           \
+  obj_t *res = code;                                                      \
+  release(last);                                                          \
+  return res;
+
 #define BINARY_OP(name, op, type)                                         \
 obj_t *name(context_t *ctx) {                                             \
     binary_params(ctx);                                                   \
-    return type(first->i op second->i);                                   \
+    obj_t *res = type(first->i op second->i);                             \
+    release(first);                                                       \
+    return res;                                                           \
 }
 
-obj_t *printObj(context_t *ctx) { print(pop(ctx->stack->l), 0); return NULL; }
+obj_t *printObj(context_t *ctx) { print(pop(ctx->stack->l)); return NULL; }
 
 /* ======================== Arithmetic operations ======================== */
 BINARY_OP(plus, +, newInt)
@@ -493,7 +483,7 @@ BINARY_OP(consumeGTE, >=, newBool)
 BINARY_OP(consumeLTE, <=, newBool)
 BINARY_OP(consumeEQ, ==, newBool)
 
-obj_t *consumeNot(context_t *ctx) { unary_params(ctx); return newBool(!last->i); }
+obj_t *consumeNot(context_t *ctx) { use_last(ctx, newBool(!last->i)) }
 
 /* ========================== Stack operations =========================== */
 obj_t *dup(context_t *ctx) { return copy(top(ctx->stack->l)); }
@@ -531,6 +521,8 @@ obj_t *consumeLoop(context_t *ctx) {
   return NULL;
 }
 
+obj_t *consumeRet(context_t *ctx) { ctx->current->ret = 1; return NULL; }
+
 func_t *newfunc(void *func, int arity) {
   func_t *f = xmalloc(sizeof(func_t));
   f->arity = arity;
@@ -567,6 +559,7 @@ void loadSymbols(context_t *ctx) {
   hmapSet(ctx->current->symbols, "if", newfunc(consumeIf, 2));
   hmapSet(ctx->current->symbols, "ifelse", newfunc(consumeIfElse, 2));
   hmapSet(ctx->current->symbols, "loop", newfunc(consumeLoop, 2));
+  hmapSet(ctx->current->symbols, "ret", newfunc(consumeRet, 0));
 }
 
 int consumeVariables(context_t *ctx, obj_t *o) {
@@ -574,15 +567,16 @@ int consumeVariables(context_t *ctx, obj_t *o) {
   obj_t *val = getVar(ctx, o->s.ptr + 1);
   if (*o->s.ptr == ':') {
     obj_t *last = pop(ctx->stack->l);
+    printf("Set %s ", o->s.ptr + 1);
+    print(last);
     hmapSet(ctx->current->vars, o->s.ptr + 1, last);
   }
   else if (*o->s.ptr == '@') {
-    if (!val) VAR_NOT_FOUND(o->s.ptr + 1);
+    retain(val);
     push(ctx->stack->l, val);
   }
   else if (*o->s.ptr == '!') {
-    if (!val) VAR_NOT_FOUND(o->s.ptr + 1);
-    EXPECTED_TYPE(val, OBJ_TYPE_LIST);
+    if (val->type != OBJ_TYPE_LIST) error("Expected a list object\n");
     exec(ctx, val); 
   }
   else return 0;
@@ -592,7 +586,7 @@ int consumeVariables(context_t *ctx, obj_t *o) {
 int consumeSymbol(context_t *ctx, obj_t *o) {
   func_t *sym = getFunc(ctx, o->s.ptr);
   if (!sym) return 0;
-  EXPECTED_STACK_LEN(ctx->stack->l, sym->arity);
+  if (ctx->stack->l.len < sym->arity) error("Expected at least %d element(s), found %d for symbol %s", sym->arity, ctx->stack->l.len, o->s.ptr);
   obj_t *(*func)(context_t *) = sym->func;
   obj_t *result = func(ctx);
   if (result) push(ctx->stack->l, result);
@@ -601,17 +595,17 @@ int consumeSymbol(context_t *ctx, obj_t *o) {
 
 void exec(context_t *ctx, obj_t *list) {
   ctx->current = newScope(ctx->current);
-  iter(list->l, o)
-    if (o->type != OBJ_TYPE_SYMBOL) {
-      push(ctx->stack->l, o);
-      continue;
-    }
-    if (consumeVariables(ctx, o)) continue;
-    consumeSymbol(ctx, o);
-    
-  enditer
-  freeScope(ctx->current);
+  foreach(o, list->l)
+    if (ctx->current->ret) break;
+    if (o->type == OBJ_TYPE_SYMBOL) {
+      if (consumeVariables(ctx, o)) continue;
+      if (!consumeSymbol(ctx, o)) error("Symbol \"%s\" not found", o->s.ptr);
+    } 
+    push(ctx->stack->l, o);
+  endfor
+  scope_t *scope = ctx->current;
   ctx->current = ctx->current->parent;
+  release(scope);
 }
 
 int main(int argc, char **argv) {
@@ -629,8 +623,7 @@ int main(int argc, char **argv) {
   prgtext[flen] = 0;
   fclose(fd);
 
-  obj_t *parsed = compile(prgtext);
   context_t *ctx = newContext();
   loadSymbols(ctx);
-  exec(ctx, parsed);
+  exec(ctx, compile(prgtext));
 }

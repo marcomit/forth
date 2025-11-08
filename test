@@ -1,8 +1,5 @@
-[
-  dup 1 ==
-    [drop 1]
-    [dup 1 - !fact *]
-  ifelse
-] :fact
+123 :i
+@i 10 + .
+12 :i
+@i .
 
--1 !fact . 
