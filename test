@@ -1,12 +1,5 @@
-[
-  dup 1 + :i
-  @i .
-] :inc
+[ 1 2 + ] :list
 
-0 :i
+@list eval .
 
-  [@i 10 <] 
-  [
-  @i !inc
-  ]
-loop
+@list 2  3 set .

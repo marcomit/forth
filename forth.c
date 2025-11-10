@@ -153,62 +153,41 @@ hmap *newHmap() {
   return h;
 }
 
-void freeBucket(bucket_t *node, int recursive) {
+void freeBucket(bucket_t *node) {
   if (!node) return;
-  if (node->next && recursive) freeBucket(node->next, recursive);
+  freeBucket(node->next);
   free(node->key);
   free(node);
 }
 
 void freeHmap(hmap *m) {
-  for (size_t i = 0; i < m->size; i++) {
-    freeBucket(m->ptr[i], 1);
-  }
+  for (size_t i = 0; i < m->size; i++) freeBucket(m->ptr[i]);
   free(m->ptr);
   free(m);
 }
 
 uint32_t hash(char *string) {
   uint32_t h = 5381;
-  for (char *c = string; *c; c++) {
-    h = h * 33 + *c;
-  }
+  for (char *c = string; *c; c++) h = h * 33 + *c;
   return h;
 }
 
 void *hmapGet(hmap *m, char *key) {
-  bucket_t *node = hmapNode(m, key);
-  while (node) {
-    if (!strcmp(node->key, key)) return node->value;
-    node = node->next;
-  }
+  for (bucket_t *n = m->ptr[hmapIndex(m, key)]; n; n = n->next)
+    if (!strcmp(n->key, key)) return n->value;
   return NULL;
 }
 
-bucket_t *hmapNewBucket(char *key, void *value) {
-  bucket_t *self = xmalloc(sizeof(bucket_t));
-  self->key = strdup(key);
-  self->value = value;
-  return self;
-}
-
 void hmapSet(hmap *m, char* key, void *value) {
-  uint32_t index = hmapIndex(m, key);
-  bucket_t *dummy = m->ptr[index];
-  if (!dummy) {
-    m->ptr[index] = hmapNewBucket(key, value);
-    return;
+  uint32_t idx = hmapIndex(m, key);
+  for (bucket_t *n = m->ptr[idx]; n; n = n->next) {
+    if (!strcmp(n->key, key)) { n->value = value; return; }
   }
-  bucket_t *prev = NULL;
-  while (dummy) {
-    if (strcmp(dummy->key, key) == 0) {
-      dummy->value = value;
-      return;
-    }
-    prev = dummy;
-    dummy = dummy->next;
-  }
-  prev->next = hmapNewBucket(key, value);
+  bucket_t *new = xmalloc(sizeof(bucket_t));
+  new->key = strdup(key);
+  new->value = value;
+  new->next = m->ptr[idx];
+  m->ptr[idx] = new;
 }
 
 /* ==================================== Object management ================================= */
@@ -294,19 +273,19 @@ void print(obj_t *o) {
   }
   switch (o->type) {
     case OBJ_TYPE_BOOL:
-      printf("bool %s", o->i ? "true" : "false");
+      printf("%s", o->i ? "true" : "false");
       break;
     case OBJ_TYPE_INT:
-      printf("int %d", o->i);
+      printf("%d", o->i);
       break;
     case OBJ_TYPE_STRING:
-      printf("string \"%s\"", o->s.ptr);
+      printf("\"%s\"", o->s.ptr);
       break;
     case OBJ_TYPE_SYMBOL:
-      printf("symbol %s", o->s.ptr);
+      printf("%s", o->s.ptr);
       break;
     case OBJ_TYPE_LIST:
-      printf("list [");
+      printf("[");
       foreach(curr, o->l) printf(" "); print(curr); endfor
       printf(" ]");
       break;
@@ -347,7 +326,6 @@ func_t *getFunc(context_t *ctx, char *name) {
 
 obj_t *getVar(context_t *ctx, char *name) {
   scope_t *dummy = ctx->current;
-  // printf("Trying to get key %s with hash %d\n", name, hash(name));
   while (dummy) {
     void *val = hmapGet(dummy->vars, name);
     if (val) return (obj_t *)val;
@@ -442,9 +420,7 @@ obj_t *compile(char *text) {
     obj_t *o = NULL;
     char *start = parser.current;
     while (peek(&parser) && isspace(*parser.current)) consume(&parser);
-    if (peek(&parser) == '#') {
-      while (peek(&parser) && peek(&parser) != '\n') consume(&parser);
-    }
+    
     if (!peek(&parser)) break;
 
     if (peek(&parser) == '"') {
@@ -453,6 +429,9 @@ obj_t *compile(char *text) {
       o = parseList(&parser);
     } else if (peek(&parser) == '-' || isdigit(peek(&parser))) {
       o = parseInt(&parser);
+    } else if (peek(&parser) == '#') {
+      while (peek(&parser) && peek(&parser) != '\n') consume(&parser);
+      continue;
     } else {
       o = parseSymbol(&parser);
     }
@@ -487,6 +466,8 @@ BINARY_OP(plus, +, newInt)
 BINARY_OP(minus, -, newInt)
 BINARY_OP(division, /, newInt)
 BINARY_OP(mul, *, newInt)
+BINARY_OP(bitShiftLeft, <<, newInt)
+BINARY_OP(bitShiftRight, >>, newInt)
 
 /* ========================== Binary operations ========================== */
 BINARY_OP(consumeAnd, &&, newBool)
@@ -513,6 +494,21 @@ obj_t *consumeIf(context_t *ctx) {
   }
   return NULL;
 }
+
+/* =========================== List operations ============================ */
+obj_t *consumeListPush(context_t *ctx) { binary_params(ctx); push(first->l, second); return first; }
+obj_t *consumeListPop(context_t *ctx) { pop(top(ctx->stack->l)->l); return NULL; }
+obj_t *consumeListLen(context_t *ctx) { return newInt(top(ctx->stack->l)->l.len); }
+obj_t *consumeListEval(context_t *ctx) { exec(ctx, top(ctx->stack->l)); return NULL; }
+obj_t *consumeListSet(context_t *ctx) {
+  obj_t *value = pop(ctx->stack->l);
+  obj_t *index = pop(ctx->stack->l);
+  obj_t *list = pop(ctx->stack->l);
+  list->l.ptr[index->i] = value;
+  return NULL;
+}
+obj_t *consumeListGet(context_t *ctx) { binary_params(ctx); return first->l.ptr[second->i]; }
+
 
 obj_t *consumeIfElse(context_t *ctx) {
   obj_t *fbranch = pop(ctx->stack->l);
@@ -552,7 +548,8 @@ void loadSymbols(context_t *ctx) {
   hmapSet(ctx->current->symbols, "-", newfunc(minus, 2));
   hmapSet(ctx->current->symbols, "/", newfunc(division, 2));
   hmapSet(ctx->current->symbols, "*", newfunc(mul, 2));
-  hmapSet(ctx->current->symbols, ".", newfunc(printObj, 1));
+  hmapSet(ctx->current->symbols, "<<", newfunc(bitShiftLeft, 2));
+  hmapSet(ctx->current->symbols, ">>", newfunc(bitShiftRight, 2));
 
   /* === Boolean operations === */
   hmapSet(ctx->current->symbols, "and", newfunc(consumeAnd, 2));
@@ -576,6 +573,17 @@ void loadSymbols(context_t *ctx) {
   hmapSet(ctx->current->symbols, "ifelse", newfunc(consumeIfElse, 2));
   hmapSet(ctx->current->symbols, "loop", newfunc(consumeLoop, 2));
   hmapSet(ctx->current->symbols, "ret", newfunc(consumeRet, 0));
+
+  /* ===== IO Operations ====== */
+  hmapSet(ctx->current->symbols, ".", newfunc(printObj, 1));
+
+  /* ==== List operations ===== */
+  hmapSet(ctx->current->symbols, "push", newfunc(consumeListPush, 2));
+  hmapSet(ctx->current->symbols, "pop", newfunc(consumeListPop, 1));
+  hmapSet(ctx->current->symbols, "len", newfunc(consumeListLen, 1));
+  hmapSet(ctx->current->symbols, "eval", newfunc(consumeListEval, 1));
+  hmapSet(ctx->current->symbols, "set", newfunc(consumeListSet, 3));
+  hmapSet(ctx->current->symbols, "get", newfunc(consumeListGet, 2));
 }
 
 int consumeVariables(context_t *ctx, obj_t *o) {
@@ -612,7 +620,7 @@ int consumeSymbol(context_t *ctx, obj_t *o) {
 }
 
 void exec(context_t *ctx, obj_t *list) {
-  // ctx->current = newScope(ctx->current);
+  ctx->current = newScope(ctx->current);
   foreach(o, list->l)
     if (ctx->current->ret) break;
     if (o->type == OBJ_TYPE_SYMBOL) {
@@ -621,9 +629,9 @@ void exec(context_t *ctx, obj_t *list) {
     } 
     else push(ctx->stack->l, o);
   endfor
-  // scope_t *scope = ctx->current;
-  // ctx->current = ctx->current->parent;
-  // release(scope);
+  scope_t *scope = ctx->current;
+  ctx->current = ctx->current->parent;
+  release(scope);
 }
 
 int main(int argc, char **argv) {
@@ -643,5 +651,6 @@ int main(int argc, char **argv) {
 
   context_t *ctx = newContext();
   loadSymbols(ctx);
-  exec(ctx, compile(prgtext));
+  obj_t *parsed = compile(prgtext);
+  exec(ctx, parsed);
 }
