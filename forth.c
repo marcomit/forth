@@ -147,6 +147,7 @@ void error(const char *fmt, ...) {
 hmap *newHmap() {
   hmap *h = xmalloc(sizeof(hmap));
   h->ptr = xmalloc(sizeof(bucket_t *) * OBJ_HASHTABLE_LEN);
+  memset(h->ptr, 0, sizeof(bucket_t *) * OBJ_HASHTABLE_LEN);
   h->size = OBJ_HASHTABLE_LEN;
   h->len = 0;
   return h;
@@ -155,6 +156,7 @@ hmap *newHmap() {
 void freeBucket(bucket_t *node, int recursive) {
   if (!node) return;
   if (node->next && recursive) freeBucket(node->next, recursive);
+  free(node->key);
   free(node);
 }
 
@@ -162,6 +164,7 @@ void freeHmap(hmap *m) {
   for (size_t i = 0; i < m->size; i++) {
     freeBucket(m->ptr[i], 1);
   }
+  free(m->ptr);
   free(m);
 }
 
@@ -182,24 +185,30 @@ void *hmapGet(hmap *m, char *key) {
   return NULL;
 }
 
-// FIXME: unsupported reassignment variables
+bucket_t *hmapNewBucket(char *key, void *value) {
+  bucket_t *self = xmalloc(sizeof(bucket_t));
+  self->key = strdup(key);
+  self->value = value;
+  return self;
+}
+
 void hmapSet(hmap *m, char* key, void *value) {
   uint32_t index = hmapIndex(m, key);
-  bucket_t *node = xmalloc(sizeof(bucket_t));
-  node->key = strdup(key);
-  node->value = value;
   bucket_t *dummy = m->ptr[index];
   if (!dummy) {
-    m->ptr[index] = node;
+    m->ptr[index] = hmapNewBucket(key, value);
     return;
   }
-  while (dummy && dummy->next) {
+  bucket_t *prev = NULL;
+  while (dummy) {
     if (strcmp(dummy->key, key) == 0) {
       dummy->value = value;
       return;
     }
+    prev = dummy;
+    dummy = dummy->next;
   }
-  dummy->next = node;
+  prev->next = hmapNewBucket(key, value);
 }
 
 /* ==================================== Object management ================================= */
@@ -285,19 +294,19 @@ void print(obj_t *o) {
   }
   switch (o->type) {
     case OBJ_TYPE_BOOL:
-      printf("%s", o->i ? "true" : "false");
+      printf("bool %s", o->i ? "true" : "false");
       break;
     case OBJ_TYPE_INT:
-      printf("%d", o->i);
+      printf("int %d", o->i);
       break;
     case OBJ_TYPE_STRING:
-      printf("\"%s\"", o->s.ptr);
+      printf("string \"%s\"", o->s.ptr);
       break;
     case OBJ_TYPE_SYMBOL:
-      printf("%s", o->s.ptr);
+      printf("symbol %s", o->s.ptr);
       break;
     case OBJ_TYPE_LIST:
-      printf("[");
+      printf("list [");
       foreach(curr, o->l) printf(" "); print(curr); endfor
       printf(" ]");
       break;
@@ -334,14 +343,16 @@ func_t *getFunc(context_t *ctx, char *name) {
   return NULL;
 }
 
+#define VAR_NOT_FOUND(x) error("Variable \"%s\" not found", x)
+
 obj_t *getVar(context_t *ctx, char *name) {
   scope_t *dummy = ctx->current;
+  // printf("Trying to get key %s with hash %d\n", name, hash(name));
   while (dummy) {
     void *val = hmapGet(dummy->vars, name);
     if (val) return (obj_t *)val;
     dummy = dummy->parent;
   }
-  error("Variable \"%s\" not found", name);
   return NULL;
 }
 
@@ -431,6 +442,9 @@ obj_t *compile(char *text) {
     obj_t *o = NULL;
     char *start = parser.current;
     while (peek(&parser) && isspace(*parser.current)) consume(&parser);
+    if (peek(&parser) == '#') {
+      while (peek(&parser) && peek(&parser) != '\n') consume(&parser);
+    }
     if (!peek(&parser)) break;
 
     if (peek(&parser) == '"') {
@@ -512,12 +526,14 @@ obj_t *consumeLoop(context_t *ctx) {
   obj_t *branch = pop(ctx->stack->l);
   obj_t *condition = pop(ctx->stack->l);
 
-  do {
+  while (1) {
     exec(ctx, condition);
-    obj_t *result = top(ctx->stack->l);
-    if (result->i) break;
+    obj_t *result = pop(ctx->stack->l);
+    int should_conitnue = result->i;
+    release(result);
+    if (!should_conitnue) break;
     exec(ctx, branch);
-  } while(1);
+  }
   return NULL;
 }
 
@@ -567,15 +583,15 @@ int consumeVariables(context_t *ctx, obj_t *o) {
   obj_t *val = getVar(ctx, o->s.ptr + 1);
   if (*o->s.ptr == ':') {
     obj_t *last = pop(ctx->stack->l);
-    printf("Set %s ", o->s.ptr + 1);
-    print(last);
     hmapSet(ctx->current->vars, o->s.ptr + 1, last);
   }
   else if (*o->s.ptr == '@') {
+    if (!val) VAR_NOT_FOUND(o->s.ptr);
     retain(val);
     push(ctx->stack->l, val);
   }
   else if (*o->s.ptr == '!') {
+    if (!val) VAR_NOT_FOUND(o->s.ptr);
     if (val->type != OBJ_TYPE_LIST) error("Expected a list object\n");
     exec(ctx, val); 
   }
@@ -586,7 +602,9 @@ int consumeVariables(context_t *ctx, obj_t *o) {
 int consumeSymbol(context_t *ctx, obj_t *o) {
   func_t *sym = getFunc(ctx, o->s.ptr);
   if (!sym) return 0;
-  if (ctx->stack->l.len < sym->arity) error("Expected at least %d element(s), found %d for symbol %s", sym->arity, ctx->stack->l.len, o->s.ptr);
+  if (ctx->stack->l.len < (size_t)sym->arity) {
+    error("Expected at least %d element(s), found %d for symbol %s", sym->arity, ctx->stack->l.len, o->s.ptr);
+  }
   obj_t *(*func)(context_t *) = sym->func;
   obj_t *result = func(ctx);
   if (result) push(ctx->stack->l, result);
@@ -594,18 +612,18 @@ int consumeSymbol(context_t *ctx, obj_t *o) {
 }
 
 void exec(context_t *ctx, obj_t *list) {
-  ctx->current = newScope(ctx->current);
+  // ctx->current = newScope(ctx->current);
   foreach(o, list->l)
     if (ctx->current->ret) break;
     if (o->type == OBJ_TYPE_SYMBOL) {
       if (consumeVariables(ctx, o)) continue;
       if (!consumeSymbol(ctx, o)) error("Symbol \"%s\" not found", o->s.ptr);
     } 
-    push(ctx->stack->l, o);
+    else push(ctx->stack->l, o);
   endfor
-  scope_t *scope = ctx->current;
-  ctx->current = ctx->current->parent;
-  release(scope);
+  // scope_t *scope = ctx->current;
+  // ctx->current = ctx->current->parent;
+  // release(scope);
 }
 
 int main(int argc, char **argv) {
