@@ -11,6 +11,7 @@
 #define OBJ_TYPE_BOOL 3
 #define OBJ_TYPE_SYMBOL 4
 #define OBJ_TYPE_LIST 5
+#define OBJ_TYPE_CLOSURE 6
 
 #define OBJ_LIST_LEN 16
 #define OBJ_MAX_INT_LEN 128
@@ -78,6 +79,14 @@ typedef struct hmap {
   resizable(bucket_t *);
 } hmap;
 
+typedef struct scope_t {
+  refcounted(int);
+  hmap *symbols; /* hash map to store the functions associated to the symbols. */
+  hmap *vars; /* variables stored here. */
+  int ret;
+  struct scope_t *parent; /* scopes to handle closures.*/
+} scope_t;
+
 typedef struct obj_t {
   refcounted(int);
   int type;
@@ -89,16 +98,12 @@ typedef struct obj_t {
     struct {
       resizable(struct obj_t *);
     } l; // Used for lists
+    struct {
+      struct obj_t *code;
+      struct scope_t *scope;
+    } closure; // Closure types
   };
 } obj_t;
-
-typedef struct scope_t {
-  refcounted(int);
-  hmap *symbols; /* hash map to store the functions associated to the symbols. */
-  hmap *vars; /* variables stored here. */
-  int ret;
-  struct scope_t *parent; /* scopes to handle closures.*/
-} scope_t;
 
 typedef struct context_t {
   obj_t *stack;
@@ -242,6 +247,13 @@ obj_t *newList() {
   return list;
 }
 
+obj_t *newClosure(obj_t *code, scope_t *scope) {
+  obj_t *self = newObj(OBJ_TYPE_CLOSURE);
+  self->closure.code = code;
+  self->closure.scope = scope;
+  return self;
+}
+
 obj_t *copy(obj_t *original) {
   obj_t *cloned = newObj(original->type);
   switch (original->type) {
@@ -289,6 +301,9 @@ void print(obj_t *o) {
       foreach(curr, o->l) printf(" "); print(curr); endfor
       printf(" ]");
       break;
+    case OBJ_TYPE_CLOSURE:
+      print(o->closure.code);
+      break;
     default:
       printf("undefined");
   }
@@ -325,13 +340,25 @@ func_t *getFunc(context_t *ctx, char *name) {
 #define VAR_NOT_FOUND(x) error("Variable \"%s\" not found", x)
 
 obj_t *getVar(context_t *ctx, char *name) {
-  scope_t *dummy = ctx->current;
-  while (dummy) {
-    void *val = hmapGet(dummy->vars, name);
+  scope_t *curr = ctx->current;
+  while (curr) {
+    void *val = hmapGet(curr->vars, name);
     if (val) return (obj_t *)val;
-    dummy = dummy->parent;
+    curr = curr->parent;
   }
   return NULL;
+}
+
+void setVar(context_t *ctx, char *name, obj_t *value) {
+  scope_t *curr = ctx->current;
+  while (curr) {
+    if (hmapGet(curr->vars, name)) {
+      hmapSet(curr->vars, name, value);
+      return;
+    }
+    curr = curr->parent;
+  }
+  hmapSet(ctx->current->vars, name, value);
 }
 
 context_t *newContext() {
@@ -586,22 +613,43 @@ void loadSymbols(context_t *ctx) {
   hmapSet(ctx->current->symbols, "get", newfunc(consumeListGet, 2));
 }
 
+void printScope(scope_t *scope) {
+  printf("scope\n");
+  for (size_t i = 0; i < scope->vars->len; i++) {
+    bucket_t *curr = scope->vars->ptr[i];
+    while (curr) {
+      printf("%s\n", curr->key);
+      curr = curr->next;
+    }
+  }
+  printf("endscope\n");
+}
+
 int consumeVariables(context_t *ctx, obj_t *o) {
   if (o->s.len == 0) return 0;
   obj_t *val = getVar(ctx, o->s.ptr + 1);
   if (*o->s.ptr == ':') {
     obj_t *last = pop(ctx->stack->l);
-    hmapSet(ctx->current->vars, o->s.ptr + 1, last);
-  }
-  else if (*o->s.ptr == '@') {
-    if (!val) VAR_NOT_FOUND(o->s.ptr);
+    if (last->type == OBJ_TYPE_LIST) {
+      retain(ctx->current);
+      retain(last);
+      printf("Closure captured %s\n", o->s.ptr);
+      last = newClosure(last, ctx->current);
+    }
+    setVar(ctx, o->s.ptr + 1, last);
+  } else if (*o->s.ptr == '@') {
+    if (!val) VAR_NOT_FOUND(o->s.ptr + 1);
     retain(val);
     push(ctx->stack->l, val);
-  }
-  else if (*o->s.ptr == '!') {
+  } else if (*o->s.ptr == '!') {
     if (!val) VAR_NOT_FOUND(o->s.ptr);
-    if (val->type != OBJ_TYPE_LIST) error("Expected a list object\n");
-    exec(ctx, val); 
+    if (val->type == OBJ_TYPE_CLOSURE) {
+      scope_t *scope = ctx->current;
+      ctx->current = val->closure.scope;
+      exec(ctx, val->closure.code);
+      ctx->current = scope;
+    } else if (val->type == OBJ_TYPE_LIST) exec(ctx, val); 
+    else error("Expected a list object for %s, found %d\n", o->s.ptr + 1, val->type);
   }
   else return 0;
   return 1;
@@ -627,6 +675,12 @@ void exec(context_t *ctx, obj_t *list) {
       if (consumeVariables(ctx, o)) continue;
       if (!consumeSymbol(ctx, o)) error("Symbol \"%s\" not found", o->s.ptr);
     } 
+    else if (o->type == OBJ_TYPE_LIST && ctx->current->parent != NULL) {
+      retain(o);
+      retain(ctx->current);
+      obj_t *closure = newClosure(o, ctx->current);
+      push(ctx->stack->l, closure);
+    }
     else push(ctx->stack->l, o);
   endfor
   scope_t *scope = ctx->current;

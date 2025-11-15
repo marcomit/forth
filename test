@@ -1,5 +1,16 @@
-[ 1 2 + ] :list
+[
+  0 :count
+  [
+    @count 1 + :count
+    @count
+  ]
+] :makeCounter
 
-@list eval .
+!makeCounter :counter1
+!makeCounter :counter2
 
-@list 2  3 set .
+!counter1 .
+!counter1 .
+!counter2 .
+!counter1 .
+!counter2 .
