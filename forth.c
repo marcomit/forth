@@ -124,7 +124,7 @@ typedef struct func_t {
 
 
 obj_t *compile(char *);
- void exec(context_t *, obj_t *);
+void exec(context_t *, obj_t *);
 
 /* ================================== Memory allocator wrapper ============================ */
 
@@ -142,6 +142,18 @@ void error(const char *fmt, ...) {
     va_end(args);
     fputc('\n', stderr);
     exit(1);
+}
+
+char *readfile(const char *filename) {
+  FILE *fd = fopen(filename, "r");
+  fseek(fd, 0, SEEK_END);
+  long flen = ftell(fd);
+  char *content = xmalloc(flen + 1);
+  fseek(fd, 0, SEEK_SET);
+  fread(content, flen, 1, fd);
+  content[flen] = 0;
+  fclose(fd);
+  return content;
 }
 
 /* ======================================= Hash table ===================================== */
@@ -483,6 +495,7 @@ obj_t *name(context_t *ctx) {                                             \
     binary_params(ctx);                                                   \
     obj_t *res = type(first->i op second->i);                             \
     release(first);                                                       \
+    release(second);                                                      \
     return res;                                                           \
 }
 
@@ -517,10 +530,43 @@ obj_t *consumeIf(context_t *ctx) {
   obj_t *branch = pop(ctx->stack->l);
   obj_t *condition = pop(ctx->stack->l);
   if (condition->i) {
-    exec(ctx, branch);
+    exec(ctx, branch->closure.code);
   }
+  release(branch);
+  release(condition);
   return NULL;
 }
+
+obj_t *consumeIfElse(context_t *ctx) {
+  obj_t *fbranch = pop(ctx->stack->l);
+  obj_t *tbranch = pop(ctx->stack->l);
+  obj_t *condition = pop(ctx->stack->l);
+  exec(ctx, condition->i ? tbranch : fbranch);
+  release(fbranch);
+  release(tbranch);
+  release(condition);
+  return NULL;
+}
+
+obj_t *consumeLoop(context_t *ctx) {
+  obj_t *branch = pop(ctx->stack->l);
+  obj_t *condition = pop(ctx->stack->l);
+
+  while (1) {
+    exec(ctx, condition->closure.code);
+    obj_t *result = pop(ctx->stack->l);
+    int should_conitnue = result->i;
+    release(result);
+    if (!should_conitnue) break;
+    exec(ctx, branch->closure.code);
+  }
+
+  release(branch);
+  release(condition);
+  return NULL;
+}
+
+obj_t *consumeRet(context_t *ctx) { ctx->current->ret = 1; return NULL; }
 
 /* =========================== List operations ============================ */
 obj_t *consumeListPush(context_t *ctx) { binary_params(ctx); push(first->l, second); return first; }
@@ -536,31 +582,17 @@ obj_t *consumeListSet(context_t *ctx) {
 }
 obj_t *consumeListGet(context_t *ctx) { binary_params(ctx); return first->l.ptr[second->i]; }
 
-
-obj_t *consumeIfElse(context_t *ctx) {
-  obj_t *fbranch = pop(ctx->stack->l);
-  obj_t *tbranch = pop(ctx->stack->l);
-  obj_t *condition = pop(ctx->stack->l);
-  exec(ctx, condition->i ? tbranch : fbranch);
+obj_t *consumeInclude(context_t *ctx) {
+  obj_t *last = pop(ctx->stack->l);
+  char *file = readfile(last->s.ptr);
+  obj_t *parsed = compile(file);
+  free(file);
+  foreach(block, parsed->l)
+    push(ctx->stack->l, block);
+  endfor
+  release(last);
   return NULL;
 }
-
-obj_t *consumeLoop(context_t *ctx) {
-  obj_t *branch = pop(ctx->stack->l);
-  obj_t *condition = pop(ctx->stack->l);
-
-  while (1) {
-    exec(ctx, condition);
-    obj_t *result = pop(ctx->stack->l);
-    int should_conitnue = result->i;
-    release(result);
-    if (!should_conitnue) break;
-    exec(ctx, branch);
-  }
-  return NULL;
-}
-
-obj_t *consumeRet(context_t *ctx) { ctx->current->ret = 1; return NULL; }
 
 func_t *newfunc(void *func, int arity) {
   func_t *f = xmalloc(sizeof(func_t));
@@ -611,18 +643,9 @@ void loadSymbols(context_t *ctx) {
   hmapSet(ctx->current->symbols, "eval", newfunc(consumeListEval, 1));
   hmapSet(ctx->current->symbols, "set", newfunc(consumeListSet, 3));
   hmapSet(ctx->current->symbols, "get", newfunc(consumeListGet, 2));
-}
 
-void printScope(scope_t *scope) {
-  printf("scope\n");
-  for (size_t i = 0; i < scope->vars->len; i++) {
-    bucket_t *curr = scope->vars->ptr[i];
-    while (curr) {
-      printf("%s\n", curr->key);
-      curr = curr->next;
-    }
-  }
-  printf("endscope\n");
+  /* ==== Module operations === */
+  hmapSet(ctx->current->symbols, "include", newfunc(consumeInclude, 1));
 }
 
 int consumeVariables(context_t *ctx, obj_t *o) {
@@ -669,6 +692,9 @@ int consumeSymbol(context_t *ctx, obj_t *o) {
 
 void exec(context_t *ctx, obj_t *list) {
   ctx->current = newScope(ctx->current);
+  if (!ctx->current->parent) {
+    print(list);
+  }
   foreach(o, list->l)
     if (ctx->current->ret) break;
     if (o->type == OBJ_TYPE_SYMBOL) {
@@ -681,7 +707,10 @@ void exec(context_t *ctx, obj_t *list) {
       obj_t *closure = newClosure(o, ctx->current);
       push(ctx->stack->l, closure);
     }
-    else push(ctx->stack->l, o);
+    else {
+      retain(o);
+      push(ctx->stack->l, o);
+    }
   endfor
   scope_t *scope = ctx->current;
   ctx->current = ctx->current->parent;
@@ -694,14 +723,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  FILE *fd = fopen(argv[1], "r");
-  fseek(fd, 0, SEEK_END);
-  long flen = ftell(fd);
-  char *prgtext = xmalloc(flen + 1);
-  fseek(fd, 0, SEEK_SET);
-  fread(prgtext, flen, 1, fd);
-  prgtext[flen] = 0;
-  fclose(fd);
+  char *prgtext = readfile(argv[1]);
 
   context_t *ctx = newContext();
   loadSymbols(ctx);
