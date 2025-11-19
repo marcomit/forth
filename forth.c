@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdbool.h>
 
 #define OBJ_TYPE_STRING 1
 #define OBJ_TYPE_INT 2
@@ -124,7 +125,7 @@ typedef struct func_t {
 
 
 obj_t *compile(char *);
-void exec(context_t *, obj_t *);
+void exec(context_t *, obj_t *, bool);
 
 /* ================================== Memory allocator wrapper ============================ */
 
@@ -530,7 +531,7 @@ obj_t *consumeIf(context_t *ctx) {
   obj_t *branch = pop(ctx->stack->l);
   obj_t *condition = pop(ctx->stack->l);
   if (condition->i) {
-    exec(ctx, branch->closure.code);
+    exec(ctx, branch->closure.code, true);
   }
   release(branch);
   release(condition);
@@ -541,7 +542,7 @@ obj_t *consumeIfElse(context_t *ctx) {
   obj_t *fbranch = pop(ctx->stack->l);
   obj_t *tbranch = pop(ctx->stack->l);
   obj_t *condition = pop(ctx->stack->l);
-  exec(ctx, condition->i ? tbranch : fbranch);
+  exec(ctx, (condition->i ? tbranch : fbranch)->closure.code, true);
   release(fbranch);
   release(tbranch);
   release(condition);
@@ -553,12 +554,12 @@ obj_t *consumeLoop(context_t *ctx) {
   obj_t *condition = pop(ctx->stack->l);
 
   while (1) {
-    exec(ctx, condition->closure.code);
+    exec(ctx, condition->closure.code, true);
     obj_t *result = pop(ctx->stack->l);
     int should_conitnue = result->i;
     release(result);
     if (!should_conitnue) break;
-    exec(ctx, branch->closure.code);
+    exec(ctx, branch->closure.code, true);
   }
 
   release(branch);
@@ -572,7 +573,7 @@ obj_t *consumeRet(context_t *ctx) { ctx->current->ret = 1; return NULL; }
 obj_t *consumeListPush(context_t *ctx) { binary_params(ctx); push(first->l, second); return first; }
 obj_t *consumeListPop(context_t *ctx) { pop(top(ctx->stack->l)->l); return NULL; }
 obj_t *consumeListLen(context_t *ctx) { return newInt(top(ctx->stack->l)->l.len); }
-obj_t *consumeListEval(context_t *ctx) { exec(ctx, top(ctx->stack->l)); return NULL; }
+obj_t *consumeListEval(context_t *ctx) { exec(ctx, top(ctx->stack->l), true); return NULL; }
 obj_t *consumeListSet(context_t *ctx) {
   obj_t *value = pop(ctx->stack->l);
   obj_t *index = pop(ctx->stack->l);
@@ -586,10 +587,7 @@ obj_t *consumeInclude(context_t *ctx) {
   obj_t *last = pop(ctx->stack->l);
   char *file = readfile(last->s.ptr);
   obj_t *parsed = compile(file);
-  free(file);
-  foreach(block, parsed->l)
-    push(ctx->stack->l, block);
-  endfor
+  exec(ctx, parsed, false);
   release(last);
   return NULL;
 }
@@ -656,7 +654,6 @@ int consumeVariables(context_t *ctx, obj_t *o) {
     if (last->type == OBJ_TYPE_LIST) {
       retain(ctx->current);
       retain(last);
-      printf("Closure captured %s\n", o->s.ptr);
       last = newClosure(last, ctx->current);
     }
     setVar(ctx, o->s.ptr + 1, last);
@@ -665,13 +662,13 @@ int consumeVariables(context_t *ctx, obj_t *o) {
     retain(val);
     push(ctx->stack->l, val);
   } else if (*o->s.ptr == '!') {
-    if (!val) VAR_NOT_FOUND(o->s.ptr);
+    if (!val) VAR_NOT_FOUND(o->s.ptr + 1);
     if (val->type == OBJ_TYPE_CLOSURE) {
       scope_t *scope = ctx->current;
       ctx->current = val->closure.scope;
-      exec(ctx, val->closure.code);
+      exec(ctx, val->closure.code, true);
       ctx->current = scope;
-    } else if (val->type == OBJ_TYPE_LIST) exec(ctx, val); 
+    } else if (val->type == OBJ_TYPE_LIST) exec(ctx, val, true); 
     else error("Expected a list object for %s, found %d\n", o->s.ptr + 1, val->type);
   }
   else return 0;
@@ -690,11 +687,9 @@ int consumeSymbol(context_t *ctx, obj_t *o) {
   return 1;
 }
 
-void exec(context_t *ctx, obj_t *list) {
-  ctx->current = newScope(ctx->current);
-  if (!ctx->current->parent) {
-    print(list);
-  }
+void exec(context_t *ctx, obj_t *list, bool create_scope) {
+  if (create_scope) ctx->current = newScope(ctx->current);
+
   foreach(o, list->l)
     if (ctx->current->ret) break;
     if (o->type == OBJ_TYPE_SYMBOL) {
@@ -712,9 +707,12 @@ void exec(context_t *ctx, obj_t *list) {
       push(ctx->stack->l, o);
     }
   endfor
-  scope_t *scope = ctx->current;
-  ctx->current = ctx->current->parent;
-  release(scope);
+
+  if (create_scope) {
+    scope_t *scope = ctx->current;
+    ctx->current = ctx->current->parent;
+    release(scope);
+  }
 }
 
 int main(int argc, char **argv) {
@@ -728,5 +726,5 @@ int main(int argc, char **argv) {
   context_t *ctx = newContext();
   loadSymbols(ctx);
   obj_t *parsed = compile(prgtext);
-  exec(ctx, parsed);
+  exec(ctx, parsed, false);
 }
