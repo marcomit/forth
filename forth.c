@@ -11,8 +11,9 @@
 #define OBJ_TYPE_INT 2
 #define OBJ_TYPE_BOOL 3
 #define OBJ_TYPE_SYMBOL 4
-#define OBJ_TYPE_LIST 5
-#define OBJ_TYPE_CLOSURE 6
+#define OBJ_TYPE_PTR 5
+#define OBJ_TYPE_LIST 6
+#define OBJ_TYPE_CLOSURE 7
 
 #define OBJ_LIST_LEN 16
 #define OBJ_MAX_INT_LEN 128
@@ -103,6 +104,7 @@ typedef struct obj_t {
       struct obj_t *code;
       struct scope_t *scope;
     } closure; // Closure types
+    struct obj_t *ref;
   };
 } obj_t;
 
@@ -309,6 +311,8 @@ void print(obj_t *o) {
     case OBJ_TYPE_SYMBOL:
       printf("%s", o->s.ptr);
       break;
+    case OBJ_TYPE_PTR:
+      printf("%p", o->ref);
     case OBJ_TYPE_LIST:
       printf("[");
       foreach(curr, o->l) printf(" "); print(curr); endfor
@@ -670,8 +674,13 @@ int consumeVariables(context_t *ctx, obj_t *o) {
       ctx->current = scope;
     } else if (val->type == OBJ_TYPE_LIST) exec(ctx, val, true); 
     else error("Expected a list object for %s, found %d\n", o->s.ptr + 1, val->type);
-  }
-  else return 0;
+  } else if (*o->s.ptr == '*') {
+    if (!val) VAR_NOT_FOUND(o->s.ptr + 1);
+    retain(val);
+    obj_t *ptr = newObj(OBJ_TYPE_PTR);
+    ptr->ref = val;
+    push(ctx->stack->l, ptr);
+  } else return 0;
   return 1;
 }
 
